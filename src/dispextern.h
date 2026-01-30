@@ -3913,6 +3913,7 @@ extern bool tty_capable_p (struct tty_display_info *, unsigned);
 extern void set_tty_color_mode (struct tty_display_info *, struct frame *);
 extern void create_tty_output (struct frame *);
 extern struct terminal *init_tty (const char *, const char *, bool);
+extern struct terminal *init_tty_from_fd (int, const char *, const char *, bool);
 extern void tty_append_glyph (struct it *);
 
 /* All scrolling costs measured in characters.

@@ -1811,7 +1811,15 @@ affects all frames on the same terminal device.  */)
       if (!NILP (tty_type))
 	SAFE_ALLOCA_STRING (type, tty_type);
 
-      t = init_tty (name, type, 0); /* Errors are not fatal.  */
+      {
+	Lisp_Object tty_fd_val = Fassq (Qtty_fd, parms);
+#ifndef DOS_NT
+	if (CONSP (tty_fd_val) && FIXNUMP (XCDR (tty_fd_val)))
+	  t = init_tty_from_fd (XFIXNUM (XCDR (tty_fd_val)), name, type, 0);
+	else
+#endif
+	  t = init_tty (name, type, 0); /* Errors are not fatal.  */
+      }
       SAFE_FREE ();
     }
 
@@ -7231,6 +7239,7 @@ syms_of_frame (void)
   DEFSYM (Qtty_color_mode, "tty-color-mode");
   DEFSYM (Qtty, "tty");
   DEFSYM (Qtty_type, "tty-type");
+  DEFSYM (Qtty_fd, "tty-fd");
 
   DEFSYM (Qface_set_after_frame_default, "face-set-after-frame-default");
 

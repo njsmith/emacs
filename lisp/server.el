@@ -950,6 +950,35 @@ This handles splitting the command if it would be bigger than
                          (getenv-internal "DISPLAY" (process-get proc 'env)))
     frame))
 
+(defun server-create-tty-frame-from-fd (fd type proc &optional parameters)
+  "Create a tty frame using file descriptor FD received via SCM_RIGHTS.
+TYPE is the terminal type string."
+  (unless fd
+    (error "No file descriptor received from emacsclient"))
+  (unless type
+    (error "Invalid terminal type"))
+  (let ((frame
+         (server-with-environment
+             (process-get proc 'env)
+             '("LANG" "LC_CTYPE" "LC_ALL"
+               ;; For tgetent(3); list according to ncurses(3).
+               "BAUDRATE" "COLUMNS" "ESCDELAY" "HOME" "LINES"
+               "NCURSES_ASSUMED_COLORS" "NCURSES_NO_PADDING"
+               "NCURSES_NO_SETBUF" "TERM" "TERMCAP" "TERMINFO"
+               "TERMINFO_DIRS" "TERMPATH"
+               ;; rxvt wants these
+               "COLORFGBG" "COLORTERM")
+           (server--create-frame
+            nil proc
+            `((window-system . nil)
+              (tty . ,(format "<fd:%d>" fd))
+              (tty-type . ,type)
+              (tty-fd . ,fd)
+              ,@parameters)))))
+    (set-frame-parameter frame 'display
+                         (getenv-internal "DISPLAY" (process-get proc 'env)))
+    frame))
+
 (defun server-create-window-system-frame (display nowait proc parent-id
 						  &optional parameters)
   (let* ((display (or display
@@ -1265,6 +1294,7 @@ The following commands are accepted by the client:
 		frame-parameters  ;parameters for newly created frame
 		tty-name   ; nil, `window-system', or the tty name.
 		tty-type   ; string.
+		tty-fd     ; integer fd received via SCM_RIGHTS, or nil.
 		files
 		filepos
 		args-left)
@@ -1312,11 +1342,12 @@ The following commands are accepted by the client:
 
                 ;; -resume:  Resume a suspended tty frame.
                 ("-resume"
-                 (let ((terminal (process-get proc 'terminal)))
+                 (let ((terminal (process-get proc 'terminal))
+                       (new-fd (process-get-pending-fd proc)))
                    (setq dontkill t)
                    (push (lambda ()
                            (when (eq (terminal-live-p terminal) t)
-                             (resume-tty terminal)))
+                             (resume-tty terminal new-fd)))
                          commands)))
 
                 ;; -suspend:  Suspend the client's frame.  (In case we
@@ -1357,6 +1388,14 @@ The following commands are accepted by the client:
                            ;; runs on a Posix host.
                            (equal tty-name "CONOUT$"))
                    (push "-window-system" args-left)))
+
+                ;; -tty-fd TYPE:  Open a new tty frame using an fd
+                ;; received via SCM_RIGHTS ancillary data.
+                ("-tty-fd"
+                 (setq tty-type (pop args-left)
+                       tty-fd (process-get-pending-fd proc)
+                       tty-name (format "<fd:%s>" (or tty-fd "?"))
+                       dontkill (or dontkill (not use-current-frame))))
 
                 ;; -position +LINE[:COLUMN]:  Set point to the given
                 ;;  position in the next file.
@@ -1445,6 +1484,10 @@ The following commands are accepted by the client:
 		    (server-create-window-system-frame display nowait proc
 						       parent-id
 						       frame-parameters))
+		   ;; tty fd received via SCM_RIGHTS.
+		   (tty-fd
+		    (server-create-tty-frame-from-fd tty-fd tty-type proc
+						     frame-parameters))
 		   ;; When resuming on a tty, tty-name is nil.
 		   (tty-name
 		    (server-create-tty-frame tty-name tty-type proc

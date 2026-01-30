@@ -53,6 +53,7 @@ char *w32_getenv (const char *);
 # include <fcntl.h>
 # include <netinet/in.h>
 # include <sys/socket.h>
+# include <sys/uio.h>
 # include <sys/un.h>
 
 # define SOCKETS_IN_FILE_SYSTEM
@@ -811,6 +812,58 @@ sock_err_message (const char *function_name)
 }
 
 
+#ifndef WINDOWSNT
+/* Send DATA (of length LEN) on socket S with file descriptor FD as
+   SCM_RIGHTS ancillary data.  Uses sendmsg().  */
+static void
+send_with_fd (HSOCKET s, const char *data, size_t len, int fd)
+{
+  struct iovec iov;
+  iov.iov_base = (char *) data;
+  iov.iov_len = len;
+
+  union
+  {
+    struct cmsghdr hdr;
+    char buf[CMSG_SPACE (sizeof (int))];
+  } cmsgbuf;
+
+  struct msghdr msg;
+  memset (&msg, 0, sizeof msg);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = cmsgbuf.buf;
+  msg.msg_controllen = sizeof cmsgbuf.buf;
+
+  struct cmsghdr *cmsg = CMSG_FIRSTHDR (&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN (sizeof (int));
+  memcpy (CMSG_DATA (cmsg), &fd, sizeof (int));
+
+  ssize_t sent;
+  while ((sent = sendmsg (s, &msg, 0)) < 0)
+    {
+      if (errno != EINTR)
+	{
+	  message (true, "%s: failed to send %zu bytes with fd to socket: %s\n",
+		   progname, len, strerror (errno));
+	  fail ();
+	}
+    }
+}
+#endif /* !WINDOWSNT */
+
+/* File descriptor to pass via SCM_RIGHTS on the next flush, or -1.  */
+#ifndef WINDOWSNT
+static int fd_to_send = -1;
+#endif
+
+/* True if we are using fd-passing mode for the tty.  */
+#ifndef WINDOWSNT
+static bool using_tty_fd;
+#endif
+
 /* Send to S the data in *DATA when either
    - the data's last byte is '\n', or
    - the buffer is full (but this shouldn't happen)
@@ -837,6 +890,17 @@ send_to_emacs (HSOCKET s, const char *data)
 	  || (0 < sblen && send_buffer[sblen - 1] == '\n'))
 	{
 	  int sent;
+#ifndef WINDOWSNT
+	  if (fd_to_send >= 0)
+	    {
+	      int fd = fd_to_send;
+	      fd_to_send = -1;
+	      send_with_fd (s, send_buffer, sblen, fd);
+	      close (fd);
+	      sent = sblen;
+	    }
+	  else
+#endif
 	  while ((sent = send (s, send_buffer, sblen, 0)) < 0)
 	    {
 	      if (errno != EINTR)
@@ -1402,7 +1466,24 @@ act_on_signals (HSOCKET emacs_socket)
 		    }
 		}
 	      else
-		send_to_emacs (emacs_socket, "-resume \n");
+		{
+#ifndef WINDOWSNT
+		  if (using_tty_fd)
+		    {
+		      int resume_fd = dup (STDOUT_FILENO);
+		      if (resume_fd >= 0)
+			{
+			  send_with_fd (emacs_socket, "-resume \n",
+					strlen ("-resume \n"), resume_fd);
+			  close (resume_fd);
+			}
+		      else
+			send_to_emacs (emacs_socket, "-resume \n");
+		    }
+		  else
+#endif
+		    send_to_emacs (emacs_socket, "-resume \n");
+		}
 	    }
 
 	  if (got_sigtstp)
@@ -2098,11 +2179,28 @@ main (int argc, char **argv)
 	     current tty.  */
 	  init_signals ();
 
-	  send_to_emacs (emacs_socket, "-tty ");
-	  quote_argument (emacs_socket, tty_name);
-	  send_to_emacs (emacs_socket, " ");
-	  quote_argument (emacs_socket, tty_type);
-	  send_to_emacs (emacs_socket, " ");
+#ifdef SOCKETS_IN_FILE_SYSTEM
+	  /* For local (Unix domain) sockets, pass the tty fd via
+	     SCM_RIGHTS ancillary data instead of sending the device
+	     path.  This allows the server to use the tty even when
+	     it cannot access the device path (e.g., in a sandbox).  */
+	  fd_to_send = dup (STDOUT_FILENO);
+	  if (fd_to_send >= 0)
+	    {
+	      using_tty_fd = true;
+	      send_to_emacs (emacs_socket, "-tty-fd ");
+	      quote_argument (emacs_socket, tty_type);
+	      send_to_emacs (emacs_socket, " ");
+	    }
+	  else
+#endif
+	    {
+	      send_to_emacs (emacs_socket, "-tty ");
+	      quote_argument (emacs_socket, tty_name);
+	      send_to_emacs (emacs_socket, " ");
+	      quote_argument (emacs_socket, tty_type);
+	      send_to_emacs (emacs_socket, " ");
+	    }
 	}
     }
 

@@ -2452,7 +2452,7 @@ A suspended tty may be resumed by calling `resume-tty' on it.  */)
   return Qnil;
 }
 
-DEFUN ("resume-tty", Fresume_tty, Sresume_tty, 0, 1, 0,
+DEFUN ("resume-tty", Fresume_tty, Sresume_tty, 0, 2, 0,
        doc: /* Resume the previously suspended terminal device TTY.
 The terminal is opened and reinitialized.  Frames that are on the
 suspended terminal are revived.
@@ -2468,8 +2468,12 @@ device.
 suspended.
 
 TTY may be a terminal object, a frame, or nil (meaning the selected
-frame's terminal). */)
-  (Lisp_Object tty)
+frame's terminal).
+
+Optional argument FD, if an integer, specifies an already-open file
+descriptor to use instead of reopening the device by name.  This is
+used for terminals whose fd was received via SCM_RIGHTS. */)
+  (Lisp_Object tty, Lisp_Object fd_arg)
 {
 #ifndef HAVE_ANDROID
   struct terminal *t;
@@ -2489,21 +2493,38 @@ frame's terminal). */)
       t->display_info.tty->output = stdout;
       t->display_info.tty->input  = stdin;
 #else  /* !MSDOS */
-      fd = emacs_open (t->display_info.tty->name, O_RDWR | O_NOCTTY, 0);
-      t->display_info.tty->input = t->display_info.tty->output
-	= fd < 0 ? 0 : emacs_fdopen (fd, "w+");
-
-      if (! t->display_info.tty->input)
+      if (t->display_info.tty->fd_passed && FIXNUMP (fd_arg))
 	{
-	  int open_errno = errno;
-	  emacs_close (fd);
-	  report_file_errno ("Cannot reopen tty device",
-			     build_string (t->display_info.tty->name),
-			     open_errno);
+	  fd = XFIXNUM (fd_arg);
+	  t->display_info.tty->input = t->display_info.tty->output
+	    = emacs_fdopen (fd, "w+");
+	  if (! t->display_info.tty->input)
+	    {
+	      int open_errno = errno;
+	      report_file_errno ("Cannot fdopen tty fd",
+				 make_fixnum (fd), open_errno);
+	    }
 	}
+      else if (t->display_info.tty->fd_passed)
+	error ("Cannot resume fd-passed terminal without a new fd");
+      else
+	{
+	  fd = emacs_open (t->display_info.tty->name, O_RDWR | O_NOCTTY, 0);
+	  t->display_info.tty->input = t->display_info.tty->output
+	    = fd < 0 ? 0 : emacs_fdopen (fd, "w+");
 
-      if (!O_IGNORE_CTTY && strcmp (t->display_info.tty->name, dev_tty) != 0)
-        dissociate_if_controlling_tty (fd);
+	  if (! t->display_info.tty->input)
+	    {
+	      int open_errno = errno;
+	      emacs_close (fd);
+	      report_file_errno ("Cannot reopen tty device",
+				 build_string (t->display_info.tty->name),
+				 open_errno);
+	    }
+
+	  if (!O_IGNORE_CTTY && strcmp (t->display_info.tty->name, dev_tty) != 0)
+	    dissociate_if_controlling_tty (fd);
+	}
 #endif /* MSDOS */
 
       add_keyboard_wait_descriptor (fd);
@@ -2564,7 +2585,7 @@ device.  */)
   Fsuspend_tty (tty);
   struct terminal *terminal = decode_tty_terminal (tty);
   terminal->display_info.tty->output_buffer_size = XFIXNUM (size);
-  return Fresume_tty (tty);
+  return Fresume_tty (tty, Qnil);
 }
 
 DEFUN ("tty--output-buffer-size", Ftty__output_buffer_size,
@@ -4317,108 +4338,19 @@ dissociate_if_controlling_tty (int fd)
    system policy (and the required libraries are usually not
    available.)  */
 
-#ifdef HAVE_ANDROID
-_Noreturn
-#endif
-
-struct terminal *
-init_tty (const char *name, const char *terminal_type, bool must_succeed)
-{
-#ifdef HAVE_ANDROID
-  maybe_fatal (must_succeed, 0, "Text terminals are not supported"
-	       " under Android", "Text terminals are not supported"
-	       " under Android");
-#else
-  struct tty_display_info *tty = NULL;
-  struct terminal *terminal = NULL;
 #ifndef DOS_NT
+/* Common initialization for init_tty and init_tty_from_fd.  TERMINAL
+   and TTY must already be allocated with tty->input/output set, and
+   tty->name/terminal->name assigned.  Handles termcap setup, keyboard,
+   frame sizes, and init_sys_modes.  */
+static struct terminal *
+init_tty_common (struct terminal *terminal, struct tty_display_info *tty,
+		 const char *terminal_type, bool must_succeed)
+{
   char *area;
   char **address = &area;
   int status;
   sigset_t oldset;
-  bool ctty = false;  /* True if asked to open controlling tty.  */
-#endif
-
-  if (!terminal_type)
-    maybe_fatal (must_succeed, 0,
-                 "Unknown terminal type",
-                 "Unknown terminal type");
-
-  if (name == NULL)
-    name = dev_tty;
-#ifndef DOS_NT
-  if (!strcmp (name, dev_tty))
-    ctty = 1;
-#endif
-
-  /* If we already have a terminal on the given device, use that.  If
-     all such terminals are suspended, create a new one instead.  */
-  /* XXX Perhaps this should be made explicit by having init_tty
-     always create a new terminal and separating terminal and frame
-     creation on Lisp level.  */
-  terminal = get_named_terminal (name);
-  if (terminal)
-    return terminal;
-
-  terminal = create_terminal (output_termcap, NULL);
-#ifdef MSDOS
-  if (been_here > 0)
-    maybe_fatal (0, 0, "Attempt to create another terminal %s", "",
-		 name, "");
-  been_here = 1;
-  tty = &the_only_display_info;
-#else
-  tty = xzalloc (sizeof *tty);
-#endif
-  tty->top_frame = Qnil;
-  tty->next = tty_list;
-  tty_list = tty;
-
-  terminal->display_info.tty = tty;
-  tty->terminal = terminal;
-
-  tty->Wcm = xmalloc (sizeof *tty->Wcm);
-  Wcm_clear (tty);
-
-  encode_terminal_src_size = 0;
-  encode_terminal_dst_size = 0;
-
-
-#ifndef DOS_NT
-  set_tty_hooks (terminal);
-
-  {
-    /* Open the terminal device.  */
-
-    /* If !ctty, don't recognize it as our controlling terminal, and
-       don't make it the controlling tty if we don't have one now.
-
-       Alas, O_IGNORE_CTTY is a GNU extension that seems to be only
-       defined on Hurd.  On other systems, we need to explicitly
-       dissociate ourselves from the controlling tty when we want to
-       open a frame on the same terminal.  */
-    int flags = O_RDWR | O_NOCTTY | (ctty ? 0 : O_IGNORE_CTTY);
-    int fd = emacs_open (name, flags, 0);
-    tty->input = tty->output
-      = ((fd < 0 || ! isatty (fd))
-	 ? NULL
-	 : emacs_fdopen (fd, "w+"));
-
-    if (! tty->input)
-      {
-	char const *diagnostic
-	  = (fd < 0) ? "Could not open file: %s" : "Not a tty device: %s";
-	emacs_close (fd);
-        delete_terminal_internal (terminal);
-	maybe_fatal (must_succeed, terminal, diagnostic, diagnostic, name);
-      }
-
-    tty->name = xstrdup (name);
-    terminal->name = xstrdup (name);
-
-    if (!O_IGNORE_CTTY && !ctty)
-      dissociate_if_controlling_tty (fd);
-  }
 
   tty->type = xstrdup (terminal_type);
 
@@ -4633,62 +4565,6 @@ use the Bourne shell command 'TERM=...; export TERM' (C-shell:\n\
        Requires a single parameter, the color index.  */
     tty->TF_set_underline_color = "\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm";
 
-#else /* DOS_NT */
-#ifdef WINDOWSNT
-  {
-    struct frame *f = XFRAME (selected_frame);
-    int height, width;
-
-    initialize_w32_display (terminal, &width, &height);
-
-    FrameRows (tty) = height;
-    FrameCols (tty) = width;
-    tty->specified_window = height;
-
-    FRAME_VERTICAL_SCROLL_BAR_TYPE (f) = vertical_scroll_bar_none;
-    FRAME_HAS_HORIZONTAL_SCROLL_BARS (f) = 0;
-    tty->char_ins_del_ok = 1;
-    baud_rate = 19200;
-  }
-#else  /* MSDOS */
-  {
-    int height, width;
-    if (strcmp (terminal_type, "internal") == 0)
-      terminal->type = output_msdos_raw;
-    initialize_msdos_display (terminal);
-
-    get_tty_size (fileno (tty->input), &width, &height);
-    FrameCols (tty) = width;
-    FrameRows (tty) = height;
-    tty->char_ins_del_ok = 0;
-    init_baud_rate (fileno (tty->input));
-  }
-#endif	/* MSDOS */
-  tty->output = stdout;
-  tty->input = stdin;
-  /* The following two are inaccessible from w32console.c.  */
-  terminal->delete_frame_hook = &tty_free_frame_resources;
-  terminal->delete_terminal_hook = &delete_tty;
-
-  tty->name = xstrdup (name);
-  terminal->name = xstrdup (name);
-  tty->type = xstrdup (terminal_type);
-
-  add_keyboard_wait_descriptor (0);
-
-  tty->delete_in_insert_mode = 1;
-
-  UseTabs (tty) = 0;
-  tty->scroll_region_ok = 0;
-
-  /* Seems to insert lines when it's not supposed to, messing up the
-     display.  In doing a trace, it didn't seem to be called much, so I
-     don't think we're losing anything by turning it off.  */
-  tty->line_ins_del_ok = 0;
-
-  tty->TN_max_colors = 16;  /* Must be non-zero for tty-display-color-p.  */
-#endif	/* DOS_NT */
-
 #ifdef HAVE_GPM
   terminal->mouse_position_hook = term_mouse_position;
 #endif
@@ -4701,7 +4577,7 @@ use the Bourne shell command 'TERM=...; export TERM' (C-shell:\n\
      prompt in the mini-buffer.  */
   if (current_kboard == initial_kboard)
     current_kboard = terminal->kboard;
-#ifndef DOS_NT
+
   term_get_fkeys (address, terminal->kboard);
 
   /* Get frame size from system, or else from termcap.  */
@@ -4832,7 +4708,182 @@ use the Bourne shell command 'TERM=...; export TERM' (C-shell:\n\
 
   init_baud_rate (fileno (tty->input));
 
-#endif /* not DOS_NT */
+  /* Init system terminal modes (RAW or CBREAK, etc.).  */
+  init_sys_modes (tty);
+
+  return terminal;
+}
+#endif /* !DOS_NT */
+
+#ifdef HAVE_ANDROID
+_Noreturn
+#endif
+
+struct terminal *
+init_tty (const char *name, const char *terminal_type, bool must_succeed)
+{
+#ifdef HAVE_ANDROID
+  maybe_fatal (must_succeed, 0, "Text terminals are not supported"
+	       " under Android", "Text terminals are not supported"
+	       " under Android");
+#else
+  struct tty_display_info *tty = NULL;
+  struct terminal *terminal = NULL;
+#ifndef DOS_NT
+  bool ctty = false;  /* True if asked to open controlling tty.  */
+#endif
+
+  if (!terminal_type)
+    maybe_fatal (must_succeed, 0,
+                 "Unknown terminal type",
+                 "Unknown terminal type");
+
+  if (name == NULL)
+    name = dev_tty;
+#ifndef DOS_NT
+  if (!strcmp (name, dev_tty))
+    ctty = 1;
+#endif
+
+  /* If we already have a terminal on the given device, use that.  If
+     all such terminals are suspended, create a new one instead.  */
+  /* XXX Perhaps this should be made explicit by having init_tty
+     always create a new terminal and separating terminal and frame
+     creation on Lisp level.  */
+  terminal = get_named_terminal (name);
+  if (terminal)
+    return terminal;
+
+  terminal = create_terminal (output_termcap, NULL);
+#ifdef MSDOS
+  if (been_here > 0)
+    maybe_fatal (0, 0, "Attempt to create another terminal %s", "",
+		 name, "");
+  been_here = 1;
+  tty = &the_only_display_info;
+#else
+  tty = xzalloc (sizeof *tty);
+#endif
+  tty->top_frame = Qnil;
+  tty->next = tty_list;
+  tty_list = tty;
+
+  terminal->display_info.tty = tty;
+  tty->terminal = terminal;
+
+  tty->Wcm = xmalloc (sizeof *tty->Wcm);
+  Wcm_clear (tty);
+
+  encode_terminal_src_size = 0;
+  encode_terminal_dst_size = 0;
+
+
+#ifndef DOS_NT
+  set_tty_hooks (terminal);
+
+  {
+    /* Open the terminal device.  */
+
+    /* If !ctty, don't recognize it as our controlling terminal, and
+       don't make it the controlling tty if we don't have one now.
+
+       Alas, O_IGNORE_CTTY is a GNU extension that seems to be only
+       defined on Hurd.  On other systems, we need to explicitly
+       dissociate ourselves from the controlling tty when we want to
+       open a frame on the same terminal.  */
+    int flags = O_RDWR | O_NOCTTY | (ctty ? 0 : O_IGNORE_CTTY);
+    int fd = emacs_open (name, flags, 0);
+    tty->input = tty->output
+      = ((fd < 0 || ! isatty (fd))
+	 ? NULL
+	 : emacs_fdopen (fd, "w+"));
+
+    if (! tty->input)
+      {
+	char const *diagnostic
+	  = (fd < 0) ? "Could not open file: %s" : "Not a tty device: %s";
+	emacs_close (fd);
+        delete_terminal_internal (terminal);
+	maybe_fatal (must_succeed, terminal, diagnostic, diagnostic, name);
+      }
+
+    tty->name = xstrdup (name);
+    terminal->name = xstrdup (name);
+
+    if (!O_IGNORE_CTTY && !ctty)
+      dissociate_if_controlling_tty (fd);
+  }
+
+  return init_tty_common (terminal, tty, terminal_type, must_succeed);
+
+#else /* DOS_NT */
+#ifdef WINDOWSNT
+  {
+    struct frame *f = XFRAME (selected_frame);
+    int height, width;
+
+    initialize_w32_display (terminal, &width, &height);
+
+    FrameRows (tty) = height;
+    FrameCols (tty) = width;
+    tty->specified_window = height;
+
+    FRAME_VERTICAL_SCROLL_BAR_TYPE (f) = vertical_scroll_bar_none;
+    FRAME_HAS_HORIZONTAL_SCROLL_BARS (f) = 0;
+    tty->char_ins_del_ok = 1;
+    baud_rate = 19200;
+  }
+#else  /* MSDOS */
+  {
+    int height, width;
+    if (strcmp (terminal_type, "internal") == 0)
+      terminal->type = output_msdos_raw;
+    initialize_msdos_display (terminal);
+
+    get_tty_size (fileno (tty->input), &width, &height);
+    FrameCols (tty) = width;
+    FrameRows (tty) = height;
+    tty->char_ins_del_ok = 0;
+    init_baud_rate (fileno (tty->input));
+  }
+#endif	/* MSDOS */
+  tty->output = stdout;
+  tty->input = stdin;
+  /* The following two are inaccessible from w32console.c.  */
+  terminal->delete_frame_hook = &tty_free_frame_resources;
+  terminal->delete_terminal_hook = &delete_tty;
+
+  tty->name = xstrdup (name);
+  terminal->name = xstrdup (name);
+  tty->type = xstrdup (terminal_type);
+
+  add_keyboard_wait_descriptor (0);
+
+  tty->delete_in_insert_mode = 1;
+
+  UseTabs (tty) = 0;
+  tty->scroll_region_ok = 0;
+
+  /* Seems to insert lines when it's not supposed to, messing up the
+     display.  In doing a trace, it didn't seem to be called much, so I
+     don't think we're losing anything by turning it off.  */
+  tty->line_ins_del_ok = 0;
+
+  tty->TN_max_colors = 16;  /* Must be non-zero for tty-display-color-p.  */
+#endif	/* DOS_NT */
+
+#ifdef HAVE_GPM
+  terminal->mouse_position_hook = term_mouse_position;
+#endif
+  tty->mouse_highlight.mouse_face_window = Qnil;
+
+  terminal->kboard = allocate_kboard (Qnil);
+  terminal->kboard->reference_count++;
+  /* Don't let the initial kboard remain current longer than necessary.
+     That would cause problems if a file loaded on startup tries to
+     prompt in the mini-buffer.  */
+  if (current_kboard == initial_kboard)
+    current_kboard = terminal->kboard;
 
   /* Init system terminal modes (RAW or CBREAK, etc.).  */
   init_sys_modes (tty);
@@ -4840,6 +4891,61 @@ use the Bourne shell command 'TERM=...; export TERM' (C-shell:\n\
   return terminal;
 #endif /* !HAVE_ANDROID */
 }
+
+#ifndef DOS_NT
+/* Like init_tty, but use an already-open file descriptor FD instead of
+   opening a device by name.  FD must refer to a tty.  NAME is used only
+   for display purposes.  The fd is NOT closed if this function fails.  */
+struct terminal *
+init_tty_from_fd (int fd, const char *name, const char *terminal_type,
+		  bool must_succeed)
+{
+  struct tty_display_info *tty = NULL;
+  struct terminal *terminal = NULL;
+
+  if (!terminal_type)
+    maybe_fatal (must_succeed, 0,
+                 "Unknown terminal type",
+                 "Unknown terminal type");
+
+  if (!isatty (fd))
+    maybe_fatal (must_succeed, 0,
+		 "Not a tty device: fd %d", "Not a tty device: fd %d", fd);
+
+  terminal = create_terminal (output_termcap, NULL);
+  tty = xzalloc (sizeof *tty);
+  tty->top_frame = Qnil;
+  tty->next = tty_list;
+  tty_list = tty;
+
+  terminal->display_info.tty = tty;
+  tty->terminal = terminal;
+
+  tty->Wcm = xmalloc (sizeof *tty->Wcm);
+  Wcm_clear (tty);
+
+  encode_terminal_src_size = 0;
+  encode_terminal_dst_size = 0;
+
+  set_tty_hooks (terminal);
+
+  tty->input = tty->output = emacs_fdopen (fd, "w+");
+  if (! tty->input)
+    {
+      delete_terminal_internal (terminal);
+      maybe_fatal (must_succeed, terminal,
+		   "Could not fdopen tty fd %d",
+		   "Could not fdopen tty fd %d", fd);
+    }
+
+  tty->name = xstrdup (name ? name : "<fd>");
+  terminal->name = xstrdup (tty->name);
+
+  tty->fd_passed = true;
+
+  return init_tty_common (terminal, tty, terminal_type, must_succeed);
+}
+#endif /* !DOS_NT */
 
 
 static void

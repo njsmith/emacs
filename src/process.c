@@ -920,6 +920,7 @@ make_process (Lisp_Object name)
      non-Lisp data, so do it only for slots which should not be zero.  */
   p->infd = -1;
   p->outfd = -1;
+  p->pending_fd = -1;
   for (int i = 0; i < PROCESS_OPEN_FDS; i++)
     p->open_fd[i] = -1;
 
@@ -6274,6 +6275,43 @@ read_process_output (Lisp_Object proc, int channel)
 				    readmax - buffered);
       else
 #endif
+#ifdef HAVE_LOCAL_SOCKETS
+      if (p->pending_fd < 0
+	  && EQ (Fplist_get (p->childp, QCfamily, Qnil), Qlocal))
+	{
+	  struct iovec iov;
+	  iov.iov_base = chars + carryover + buffered;
+	  iov.iov_len = readmax - buffered;
+
+	  union
+	  {
+	    struct cmsghdr hdr;
+	    char buf[CMSG_SPACE (sizeof (int))];
+	  } cmsgbuf;
+	  struct msghdr msg;
+	  memset (&msg, 0, sizeof msg);
+	  msg.msg_iov = &iov;
+	  msg.msg_iovlen = 1;
+	  msg.msg_control = cmsgbuf.buf;
+	  msg.msg_controllen = sizeof cmsgbuf.buf;
+
+	  nbytes = recvmsg (channel, &msg, 0);
+
+	  if (nbytes > 0)
+	    {
+	      struct cmsghdr *cmsg = CMSG_FIRSTHDR (&msg);
+	      if (cmsg
+		  && cmsg->cmsg_level == SOL_SOCKET
+		  && cmsg->cmsg_type == SCM_RIGHTS)
+		{
+		  int received_fd;
+		  memcpy (&received_fd, CMSG_DATA (cmsg), sizeof (int));
+		  p->pending_fd = received_fd;
+		}
+	    }
+	}
+      else
+#endif
 	nbytes = emacs_read (channel, chars + carryover + buffered,
 			     readmax - buffered);
       if (nbytes > 0 && p->adaptive_read_buffering)
@@ -8645,6 +8683,22 @@ catch_child_signal (void)
 	 : old_action.sa_handler);
   unblock_child_signal (&oldset);
 }
+DEFUN ("process-get-pending-fd", Fprocess_get_pending_fd,
+       Sprocess_get_pending_fd, 1, 1, 0,
+       doc: /* Return file descriptor received via SCM_RIGHTS on PROCESS.
+Return the fd as an integer, or nil if none was received.
+The stored fd is cleared after this call.  */)
+  (Lisp_Object process)
+{
+  CHECK_PROCESS (process);
+  struct Lisp_Process *p = XPROCESS (process);
+  int fd = p->pending_fd;
+  if (fd < 0)
+    return Qnil;
+  p->pending_fd = -1;
+  return make_fixnum (fd);
+}
+
 #endif	/* subprocesses */
 
 /* Limit the number of open files to the value it had at startup.  */
@@ -9046,6 +9100,7 @@ sentinel or a process filter function has an error.  */);
   defsubr (&Sinternal_default_process_filter);
   defsubr (&Sset_process_coding_system);
   defsubr (&Sprocess_coding_system);
+  defsubr (&Sprocess_get_pending_fd);
 
  {
    Lisp_Object subfeatures = Qnil;

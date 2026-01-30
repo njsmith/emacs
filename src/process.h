@@ -191,6 +191,9 @@ struct Lisp_Process
     /* The socket type. */
     int socktype;
 
+    /* File descriptor received via SCM_RIGHTS, or -1 if none pending. */
+    int pending_fd;
+
 #ifdef HAVE_GETADDRINFO_A
     /* Whether the socket is waiting for response from an asynchronous
        DNS call. */

@@ -66,6 +66,9 @@ struct tty_display_info
   bool_bf term_initted : 1;	/* True if we have been through
 				   init_sys_modes. */
 
+  bool_bf fd_passed : 1;	/* True if tty fd was received via
+				   SCM_RIGHTS. */
+
   int reference_count;          /* Number of frames that are on this display. */
 
   struct terminal *terminal;    /* Points back to the generic terminal
