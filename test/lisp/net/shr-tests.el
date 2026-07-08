@@ -186,6 +186,16 @@ settings, then once more for each (OPTION . VALUE) pair.")
               ;; Make sure we actually saw a slice.
               (should (> slice-count 1)))))))))
 
+(ert-deftest shr-test/browse-url-data ()
+  (with-temp-buffer
+    (shr-insert-document
+     '(html nil (body nil (a ((href . "https://example.com/shr"))
+                             "SHRLINK"))))
+    (goto-char (point-min))
+    (search-forward "SHRLINK")
+    (should (equal (get-text-property (match-beginning 0) 'browse-url-data)
+                   "https://example.com/shr"))))
+
 (require 'shr)
 
 ;;; shr-tests.el ends here

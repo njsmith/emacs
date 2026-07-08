@@ -117,6 +117,17 @@
                 'browse-url-button))
     (should (get-text-property (point) 'browse-url-data))))
 
+(ert-deftest browse-url-tests-add-buttons-data-value ()
+  "The buttons' `browse-url-data' value is the URL itself.
+Redisplay consumes this property to emit OSC 8 hyperlinks on text
+terminals, so the value must be the exact URI."
+  (with-temp-buffer
+    (insert "Visit https://gnu.org")
+    (goto-char (point-min))
+    (browse-url-add-buttons)
+    (should (equal (get-text-property (- (point-max) 1) 'browse-url-data)
+                   "https://gnu.org"))))
+
 (ert-deftest browse-url-tests-button-copy ()
   (with-temp-buffer
     (insert "Visit https://gnu.org")

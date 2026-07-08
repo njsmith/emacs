@@ -55,3 +55,14 @@
         (insert input)
         (ansi-osc-apply-on-region (point-min) (point-max))
         (should (equal (buffer-string) text))))))
+
+(ert-deftest ansi-osc-tests-hyperlink-browse-url-data ()
+  "OSC 8 input leaves `browse-url-data' on the linked text.
+Redisplay consumes this property to re-emit OSC 8 hyperlinks on
+text terminals, so the value must be the exact URI."
+  (with-temp-buffer
+    (insert "\e]8;;http://example.com\e\\This is a link\e]8;;\e\\")
+    (ansi-osc-apply-on-region (point-min) (point-max))
+    (should (equal (buffer-string) "This is a link"))
+    (should (equal (get-text-property (point-min) 'browse-url-data)
+                   "http://example.com"))))
