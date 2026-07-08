@@ -187,6 +187,8 @@ and `goto-address-fontify-p'."
 			 'help-echo "mouse-2, C-c RET: follow URL")
 	    (overlay-put this-overlay
 			 'keymap goto-address-highlight-keymap)
+	    (overlay-put this-overlay 'browse-url-data
+			 (buffer-substring-no-properties s e))
 	    (overlay-put this-overlay 'goto-address t))))
       (goto-char (or start (point-min)))
       (while (re-search-forward goto-address-mail-regexp end t)
@@ -208,6 +210,10 @@ and `goto-address-fontify-p'."
 			 'help-echo "mouse-2, C-c RET: mail this address")
 	    (overlay-put this-overlay
 			 'keymap goto-address-highlight-keymap)
+	    ;; Addresses are matched bare; browse-url-data wants a URI.
+	    (overlay-put this-overlay 'browse-url-data
+			 (concat "mailto:"
+				 (buffer-substring-no-properties s e)))
 	    (overlay-put this-overlay 'goto-address t)))))))
 
 (defun goto-address-fontify-region (start end)

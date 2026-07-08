@@ -1306,6 +1306,7 @@ START, and END.  Note that START and END should be markers."
   (add-text-properties
    start (point)
    (list 'shr-url url
+         'browse-url-data url
          'button t
          'category 'shr                ; For button.el button buffers.
 	 'help-echo (let ((parsed (url-generic-parse-url
