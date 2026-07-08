@@ -19,6 +19,24 @@ with a prefix argument or by typing 'C-u C-h C-n'.
 * Changes in Emacs 30.2
 Emacs 30.2 is a bug-fix release with no new features.
 
+** Emacs can emit OSC 8 hyperlinks on text terminals.
+Text whose 'browse-url-data' property holds a URI string -- the
+property set by URL buttons such as browse-url and ansi-osc hyperlink
+buttons, and which can also be stamped directly on text -- is written
+to the terminal wrapped in OSC 8 escape sequences, which capable
+terminal emulators render as clickable hyperlinks.  This is disabled
+by default; enable it per terminal with:
+
+    (set-terminal-parameter nil 'tty-hyperlinks t)
+
+Values are only emitted when they look like a URI (an RFC 3986
+scheme followed by a colon); other values are silently ignored.
+URIs are sanitized before being emitted: printable ASCII characters
+are sent as-is, and everything else is percent-encoded.  Overly long
+URIs (more than 2048 bytes) are ignored.  Each terminal can display
+up to 511 distinct link targets simultaneously; ids of links that are
+no longer displayed are recycled automatically.
+
 
 * Installation Changes in Emacs 30.1
 

@@ -1002,6 +1002,8 @@ static enum prop_handled handle_display_prop (struct it *);
 static enum prop_handled handle_composition_prop (struct it *);
 static enum prop_handled handle_overlay_change (struct it *);
 static enum prop_handled handle_fontified_prop (struct it *);
+static enum prop_handled handle_browse_url_prop (struct it *);
+static Lisp_Object get_it_property (struct it *, Lisp_Object);
 
 /* Properties handled by iterators.  */
 
@@ -1011,6 +1013,10 @@ static struct props it_props[] =
   /* Handle `face' before `display' because some sub-properties of
      `display' need to know the face.  */
   {SYMBOL_INDEX (Qface),	FACE_PROP_IDX,		handle_face_prop},
+  /* Registering `browse-url-data' here does double duty: it runs the
+     handler at stop positions, and it makes compute_stop_pos treat
+     browse-url-data boundaries as stop positions in the first place.  */
+  {SYMBOL_INDEX (Qbrowse_url_data), BROWSE_URL_PROP_IDX, handle_browse_url_prop},
   {SYMBOL_INDEX (Qdisplay),	DISPLAY_PROP_IDX,	handle_display_prop},
   {SYMBOL_INDEX (Qinvisible),	INVISIBLE_PROP_IDX,	handle_invisible_prop},
   {SYMBOL_INDEX (Qcomposition),	COMPOSITION_PROP_IDX, handle_composition_prop},
@@ -1216,7 +1222,6 @@ static void normal_char_ascent_descent (struct font *, int, int *, int *);
 static void append_stretch_glyph (struct it *, Lisp_Object,
                                   int, int, int);
 
-static Lisp_Object get_it_property (struct it *, Lisp_Object);
 static Lisp_Object calc_line_height_property (struct it *, Lisp_Object,
 					      struct font *, int, bool);
 static int adjust_glyph_width_for_mouse_face (struct glyph *,
@@ -4758,6 +4763,36 @@ face_at_pos (const struct it *it, enum lface_attribute_index attr_filter)
 }
 
 
+/* Set up iterator IT from the `browse-url-data' property at its
+   current position.  Called from handle_stop.  On a text terminal
+   whose `tty-hyperlinks' terminal parameter is non-nil, a
+   string-valued `browse-url-data' property that looks like a URI
+   makes the covered text an OSC 8 hyperlink: the URI is interned
+   into the terminal's hyperlink table and the resulting id is stored
+   into IT, from where the tty glyph producers copy it into each
+   glyph.  */
+static enum prop_handled
+handle_browse_url_prop (struct it *it)
+{
+  it->hyperlink_id = 0;
+
+  if (it->f != NULL && FRAME_TERMCAP_P (it->f))
+    {
+      struct terminal *t = FRAME_TERMINAL (it->f);
+      Lisp_Object enabled = Fassq (Qtty_hyperlinks, t->param_alist);
+
+      if (CONSP (enabled) && !NILP (XCDR (enabled)))
+	{
+	  Lisp_Object href = get_it_property (it, Qbrowse_url_data);
+
+	  if (STRINGP (href))
+	    it->hyperlink_id = tty_intern_hyperlink (t, href);
+	}
+    }
+
+  return HANDLED_NORMALLY;
+}
+
 /* Set up iterator IT from face properties at its current position.
    Called from handle_stop.  */
 static enum prop_handled
@@ -7144,6 +7179,7 @@ push_it (struct it *it, struct text_pos *position)
   p->bidi_p = it->bidi_p;
   p->paragraph_embedding = it->paragraph_embedding;
   p->from_disp_prop_p = it->from_disp_prop_p;
+  p->hyperlink_id = it->hyperlink_id;
   ++it->sp;
 
   /* Save the state of the bidi iterator as well. */
@@ -7290,6 +7326,7 @@ pop_it (struct it *it)
   it->bidi_p = p->bidi_p;
   it->paragraph_embedding = p->paragraph_embedding;
   it->from_disp_prop_p = p->from_disp_prop_p;
+  it->hyperlink_id = p->hyperlink_id;
   it->align_visually_p = false;
   if (it->bidi_p)
     {
@@ -24064,10 +24101,14 @@ extend_face_to_end_of_line (struct it *it)
       struct text_pos saved_pos = it->position;
       Lisp_Object saved_object = it->object;;
       enum display_element_type saved_what = it->what;
+      unsigned saved_hyperlink_id = it->hyperlink_id;
 
       it->what = IT_CHARACTER;
       clear_position (it);
       it->object = Qnil;
+      /* The blanks filling out the line are not part of any
+	 hyperlink, even when the line ends inside one.  */
+      it->hyperlink_id = 0;
       it->c = it->char_to_display = ' ';
       it->len = 1;
 
@@ -24178,6 +24219,7 @@ extend_face_to_end_of_line (struct it *it)
       it->object = saved_object;
       it->position = saved_pos;
       it->what = saved_what;
+      it->hyperlink_id = saved_hyperlink_id;
       it->face_id = orig_face_id;
     }
 }
@@ -31401,6 +31443,7 @@ append_glyph (struct it *it)
       glyph->u.ch = it->char_to_display;
       glyph->slice.img = null_glyph_slice;
       glyph->font_type = FONT_TYPE_UNKNOWN;
+      glyph->hyperlink_id = 0;
       if (it->bidi_p)
 	{
 	  glyph->resolved_level = it->bidi_it.resolved_level;
@@ -31484,6 +31527,7 @@ append_composite_glyph (struct it *it)
       glyph->glyph_not_available_p = it->glyph_not_available_p;
       glyph->face_id = it->face_id;
       glyph->font_type = FONT_TYPE_UNKNOWN;
+      glyph->hyperlink_id = 0;
       if (it->bidi_p)
 	{
 	  glyph->resolved_level = it->bidi_it.resolved_level;
@@ -31691,6 +31735,7 @@ produce_image_glyph (struct it *it)
 	  glyph->u.img_id = img->id;
 	  glyph->slice.img = slice;
 	  glyph->font_type = FONT_TYPE_UNKNOWN;
+	  glyph->hyperlink_id = 0;
 	  if (it->bidi_p)
 	    {
 	      glyph->resolved_level = it->bidi_it.resolved_level;
@@ -31796,6 +31841,7 @@ produce_xwidget_glyph (struct it *it)
 	  glyph->face_id = it->face_id;
           glyph->u.xwidget = it->xwidget->xwidget_id;
 	  glyph->font_type = FONT_TYPE_UNKNOWN;
+	  glyph->hyperlink_id = 0;
 	  if (it->bidi_p)
 	    {
 	      glyph->resolved_level = it->bidi_it.resolved_level;
@@ -31886,6 +31932,7 @@ append_stretch_glyph (struct it *it, Lisp_Object object,
       glyph->u.stretch.height = height;
       glyph->slice.img = null_glyph_slice;
       glyph->font_type = FONT_TYPE_UNKNOWN;
+      glyph->hyperlink_id = 0;
       if (it->bidi_p)
 	{
 	  glyph->resolved_level = it->bidi_it.resolved_level;
@@ -32159,6 +32206,9 @@ produce_special_glyphs (struct it *it, enum display_element_type what)
 
   temp_it = *it;
   temp_it.object = Qnil;
+  /* Truncation and continuation glyphs must never inherit a
+     hyperlink from adjacent text.  */
+  temp_it.hyperlink_id = 0;
   memset (&temp_it.current, 0, sizeof temp_it.current);
 
   if (what == IT_CONTINUATION)
@@ -32256,6 +32306,8 @@ pad_mode_line (struct it *it, bool mode_line_p)
   eassert (!FRAME_WINDOW_P (it->f));
   temp_it = *it;
   temp_it.object = Qnil;
+  /* Padding glyphs must never inherit a hyperlink.  */
+  temp_it.hyperlink_id = 0;
   memset (&temp_it.current, 0, sizeof temp_it.current);
 
   SET_GLYPH (glyph, mode_line_p ? '-' : ' ', it->base_face_id);
@@ -32423,6 +32475,7 @@ append_glyphless_glyph (struct it *it, int face_id, bool for_no_font, int len,
       glyph->glyph_not_available_p = false;
       glyph->face_id = face_id;
       glyph->font_type = FONT_TYPE_UNKNOWN;
+      glyph->hyperlink_id = 0;
       if (it->bidi_p)
 	{
 	  glyph->resolved_level = it->bidi_it.resolved_level;
@@ -37328,6 +37381,12 @@ be let-bound around code that needs to disable messages temporarily. */);
   DEFSYM (QCfile, ":file");
   DEFSYM (Qfontified, "fontified");
   DEFSYM (Qfontification_functions, "fontification-functions");
+
+  /* Property consulted for OSC 8 hyperlinks on text terminals (the
+     convention browse-url buttons already use), and the terminal
+     parameter gating their emission.  */
+  DEFSYM (Qbrowse_url_data, "browse-url-data");
+  DEFSYM (Qtty_hyperlinks, "tty-hyperlinks");
   DEFSYM (Qlong_line_optimizations_in_fontification_functions,
 	  "long-line-optimizations-in-fontification-functions");
 

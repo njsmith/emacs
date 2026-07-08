@@ -495,6 +495,14 @@ struct terminal
     the selection-values.  */
   Lisp_Object Vselection_alist;
 
+  /* For text terminals, a 512-slot vector interning the URIs of OSC 8
+     hyperlinks emitted on this terminal, or nil if no hyperlink has
+     been interned yet.  Slot N holds the sanitized URI (a unibyte
+     string of printable ASCII) of hyperlink id N; slot 0 is never
+     used, since hyperlink id 0 in a glyph means "no hyperlink".
+     Unused slots are nil.  See tty_intern_hyperlink in term.c.  */
+  Lisp_Object tty_hyperlink_table;
+
   /* If a char-table, this maps characters to terminal glyph codes.
      If t, the mapping is not available.  If nil, it is not known
      whether the mapping is available.  */
@@ -955,6 +963,7 @@ extern struct terminal *create_terminal (enum output_method,
 extern void delete_terminal (struct terminal *);
 extern void delete_terminal_internal (struct terminal *);
 extern Lisp_Object terminal_glyph_code (struct terminal *, int);
+extern unsigned tty_intern_hyperlink (struct terminal *, Lisp_Object);
 
 /* The initial terminal device, created by initial_term_init.  */
 extern struct terminal *initial_terminal;

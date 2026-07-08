@@ -20,6 +20,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 /* New redisplay, TTY faces by Gerd Moellmann <gerd@gnu.org>.  */
 
 #include <config.h>
+#include <c-ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -746,7 +747,236 @@ encode_terminal_code (struct glyph *src, int src_len,
 
 #endif /* HAVE_ANDROID */
 
+/* OSC 8 hyperlinks on text terminals.
+
+   Text whose `browse-url-data' property (the convention used by
+   browse-url and ansi-osc hyperlink buttons) holds a URI string is
+   emitted wrapped in OSC 8 escape sequences when the terminal
+   parameter `tty-hyperlinks' is non-nil.  URIs are unbounded nominal
+   metadata, so instead of storing them in glyphs (or abusing faces),
+   each distinct URI is interned into the terminal's
+   tty_hyperlink_table and glyphs carry only the small table index in
+   their hyperlink_id bit-field -- the same pattern as the face
+   cache.  Interning is
+   content-based, so the same URI maps to the same id across frames
+   and redisplays, which keeps the display differ quiet for unchanged
+   text.  The update phase never looks at Lisp text properties: it
+   uses only glyph->hyperlink_id and AREF on the intern table.  */
+
+/* Size of a terminal's hyperlink intern table.  Must not exceed the
+   range of the glyph hyperlink_id bit-field (9 bits); slot 0 is
+   reserved to mean "no hyperlink".  */
+#define TTY_HYPERLINK_TABLE_SIZE 512
+
+/* Longest URI, in bytes before percent-encoding, that we accept.  */
+#define TTY_HYPERLINK_MAX_URI_BYTES 2048
+
+/* Return a sanitized copy of URI safe to splice into an OSC 8
+   sequence: printable ASCII characters (0x21..0x7E) are passed
+   through, everything else (including spaces and control bytes) is
+   %XX percent-encoded.  The string's internal bytes are encoded
+   directly; for real characters the internal encoding coincides with
+   UTF-8, and raw bytes get encoded as themselves.  In particular no
+   byte outside 0x21..0x7E ever reaches the terminal unencoded, so
+   embedded C0 and C1 controls cannot terminate or nest sequences.
+
+   `browse-url-data' is a shared convention whose values are not
+   formally typed, so additionally require the string to start with a
+   URI scheme (RFC 3986: ALPHA, then ALPHA / DIGIT / "+" / "-" / ".",
+   then ":") and reject anything else.  Any scheme is accepted: Emacs
+   only emits the link, and the terminal emulator applies its own
+   policy when the user activates it, so allowlisting schemes here
+   would break irc:, gemini: and the like for no security gain.
+
+   Value is a fresh unibyte string without text properties, or nil if
+   URI is empty, too long, or does not look like a URI.  */
+
+static Lisp_Object
+tty_sanitize_hyperlink_uri (Lisp_Object uri)
+{
+  ptrdiff_t nbytes = SBYTES (uri);
+
+  if (nbytes == 0 || nbytes > TTY_HYPERLINK_MAX_URI_BYTES)
+    return Qnil;
+
+  unsigned char *src = SDATA (uri);
+
+  if (!c_isalpha (src[0]))
+    return Qnil;
+  ptrdiff_t scheme_end = 1;
+  while (scheme_end < nbytes
+	 && (c_isalnum (src[scheme_end]) || src[scheme_end] == '+'
+	     || src[scheme_end] == '-' || src[scheme_end] == '.'))
+    scheme_end++;
+  if (scheme_end == nbytes || src[scheme_end] != ':')
+    return Qnil;
+  ptrdiff_t outbytes = 0;
+  for (ptrdiff_t i = 0; i < nbytes; i++)
+    outbytes += (src[i] >= 0x21 && src[i] <= 0x7E) ? 1 : 3;
+
+  Lisp_Object clean = make_uninit_string (outbytes);
+  unsigned char *dst = SDATA (clean);
+  for (ptrdiff_t i = 0; i < nbytes; i++)
+    {
+      unsigned char c = src[i];
+      if (c >= 0x21 && c <= 0x7E)
+	*dst++ = c;
+      else
+	{
+	  static char const hexdigit[16] = "0123456789ABCDEF";
+	  *dst++ = '%';
+	  *dst++ = hexdigit[c >> 4];
+	  *dst++ = hexdigit[c & 0xF];
+	}
+    }
+  return clean;
+}
+
+/* Free the slots of terminal T's hyperlink table whose ids are not
+   used by any glyph of any of T's frames.  An id is considered live
+   if it occurs anywhere in a frame's glyph pools.  We scan the pools
+   rather than matrix rows because mid-layout the desired matrix rows
+   can carry stale used[] counts while window rows write into the same
+   pool; scanning whole pools is conservative and safe.  */
+
+static void
+tty_sweep_hyperlinks (struct terminal *t)
+{
+  Lisp_Object table = t->tty_hyperlink_table;
+  bool live[TTY_HYPERLINK_TABLE_SIZE];
+  Lisp_Object tail, frame;
+
+  if (!VECTORP (table))
+    return;
+
+  memset (live, 0, sizeof live);
+
+  FOR_EACH_FRAME (tail, frame)
+    {
+      struct frame *f = XFRAME (frame);
+      if (FRAME_TERMINAL (f) != t)
+	continue;
+
+      struct glyph_pool *pools[] = { f->current_pool, f->desired_pool };
+      for (int p = 0; p < 2; p++)
+	{
+	  struct glyph_pool *pool = pools[p];
+	  if (pool == NULL)
+	    continue;
+	  for (ptrdiff_t i = 0; i < pool->nglyphs; i++)
+	    live[pool->glyphs[i].hyperlink_id] = true;
+	}
+    }
+
+  for (int i = 1; i < TTY_HYPERLINK_TABLE_SIZE; i++)
+    if (!live[i])
+      ASET (table, i, Qnil);
+}
+
+/* Intern URI into terminal T's hyperlink table and return its id.
+   Value is 0 (meaning "no hyperlink") if URI is not a string, is
+   empty, over-long or not URI-shaped, or if the table is full of
+   live links.  Freed
+   slots are reused smallest-first; recycled ids are wire-safe because
+   terminals group hyperlinked cells by the (id, URI) pair.  */
+
+unsigned
+tty_intern_hyperlink (struct terminal *t, Lisp_Object uri)
+{
+  if (!STRINGP (uri))
+    return 0;
+
+  Lisp_Object clean = tty_sanitize_hyperlink_uri (uri);
+  if (NILP (clean))
+    return 0;
+
+  Lisp_Object table = t->tty_hyperlink_table;
+  if (!VECTORP (table))
+    {
+      table = make_nil_vector (TTY_HYPERLINK_TABLE_SIZE);
+      t->tty_hyperlink_table = table;
+    }
+
+  int free_slot = -1;
+  for (int i = 1; i < TTY_HYPERLINK_TABLE_SIZE; i++)
+    {
+      Lisp_Object slot = AREF (table, i);
+      if (STRINGP (slot))
+	{
+	  if (SBYTES (slot) == SBYTES (clean)
+	      && memcmp (SDATA (slot), SDATA (clean), SBYTES (clean)) == 0)
+	    return i;
+	}
+      else if (free_slot < 0)
+	free_slot = i;
+    }
+
+  if (free_slot < 0)
+    {
+      /* Table full: drop ids no glyph references any more, then
+	 retry.  If everything is live, degrade to no hyperlink
+	 rather than alias an existing id.  */
+      tty_sweep_hyperlinks (t);
+      for (int i = 1; i < TTY_HYPERLINK_TABLE_SIZE; i++)
+	if (!STRINGP (AREF (table, i)))
+	  {
+	    free_slot = i;
+	    break;
+	  }
+      if (free_slot < 0)
+	return 0;
+    }
+
+  ASET (table, free_slot, clean);
+  return free_slot;
+}
+
 #ifndef HAVE_ANDROID
+
+/* Write LEN bytes at S to TTY's output, and to its termscript if one
+   is active.  */
+
+static void
+tty_hyperlink_output (struct tty_display_info *tty, char const *s,
+		      ptrdiff_t len)
+{
+  fwrite (s, 1, len, tty->output);
+  if (tty->termscript)
+    fwrite (s, 1, len, tty->termscript);
+}
+
+/* Emit the OSC 8 opening sequence for hyperlink ID on frame F's
+   terminal: ESC ] 8 ; id=ID ; URI ESC \.  Callers must ensure input
+   is blocked and must emit the matching close in the same
+   block_input section, so open hyperlink state can never leak into
+   other output.  */
+
+static void
+tty_hyperlink_open (struct frame *f, unsigned id)
+{
+  struct tty_display_info *tty = FRAME_TTY (f);
+  Lisp_Object table = FRAME_TERMINAL (f)->tty_hyperlink_table;
+
+  if (!VECTORP (table) || id >= ASIZE (table))
+    return;
+  Lisp_Object uri = AREF (table, id);
+  if (!STRINGP (uri))
+    return;
+
+  char buf[sizeof "\033]8;id=;" + INT_STRLEN_BOUND (unsigned)];
+  int n = sprintf (buf, "\033]8;id=%u;", id);
+  tty_hyperlink_output (tty, buf, n);
+  tty_hyperlink_output (tty, SSDATA (uri), SBYTES (uri));
+  tty_hyperlink_output (tty, "\033\\", 2);
+}
+
+/* Emit the OSC 8 closing sequence on frame F's terminal.  */
+
+static void
+tty_hyperlink_close (struct frame *f)
+{
+  tty_hyperlink_output (FRAME_TTY (f), "\033]8;;\033\\", 7);
+}
 
 /* An implementation of write_glyphs for termcap frames. */
 
@@ -785,11 +1015,13 @@ tty_write_glyphs (struct frame *f, struct glyph *string, int len)
 
   for (stringlen = len; stringlen != 0; stringlen -= n)
     {
-      /* Identify a run of glyphs with the same face.  */
+      /* Identify a run of glyphs with the same face and hyperlink.  */
       int face_id = string->face_id;
+      unsigned hyperlink_id = string->hyperlink_id;
 
       for (n = 1; n < stringlen; ++n)
-	if (string[n].face_id != face_id)
+	if (string[n].face_id != face_id
+	    || string[n].hyperlink_id != hyperlink_id)
 	  break;
 
       /* Turn appearance modes of the face of the run on.  */
@@ -803,10 +1035,14 @@ tty_write_glyphs (struct frame *f, struct glyph *string, int len)
       if (coding->produced > 0)
 	{
 	  block_input ();
+	  if (hyperlink_id)
+	    tty_hyperlink_open (f, hyperlink_id);
 	  fwrite (conversion_buffer, 1, coding->produced, tty->output);
-	  clearerr (tty->output);
 	  if (tty->termscript)
 	    fwrite (conversion_buffer, 1, coding->produced, tty->termscript);
+	  if (hyperlink_id)
+	    tty_hyperlink_close (f);
+	  clearerr (tty->output);
 	  unblock_input ();
 	}
       string += n;
@@ -858,16 +1094,38 @@ tty_write_glyphs_with_face (register struct frame *f, register struct glyph *str
   tty_highlight_if_desired (tty);
   turn_on_face (f, face_id);
 
-  coding->mode |= CODING_MODE_LAST_BLOCK;
-  conversion_buffer = encode_terminal_code (string, len, coding);
-  if (coding->produced > 0)
+  /* The face is uniform, but the run may still cross hyperlink
+     boundaries; write each hyperlink sub-run separately, bracketed by
+     its own OSC 8 sequences, so mouse highlighting preserves the
+     links.  */
+  while (len > 0)
     {
-      block_input ();
-      fwrite (conversion_buffer, 1, coding->produced, tty->output);
-      clearerr (tty->output);
-      if (tty->termscript)
-	fwrite (conversion_buffer, 1, coding->produced, tty->termscript);
-      unblock_input ();
+      int n;
+      unsigned hyperlink_id = string->hyperlink_id;
+
+      for (n = 1; n < len; ++n)
+	if (string[n].hyperlink_id != hyperlink_id)
+	  break;
+
+      if (n == len)
+	/* This is the last run.  */
+	coding->mode |= CODING_MODE_LAST_BLOCK;
+      conversion_buffer = encode_terminal_code (string, n, coding);
+      if (coding->produced > 0)
+	{
+	  block_input ();
+	  if (hyperlink_id)
+	    tty_hyperlink_open (f, hyperlink_id);
+	  fwrite (conversion_buffer, 1, coding->produced, tty->output);
+	  if (tty->termscript)
+	    fwrite (conversion_buffer, 1, coding->produced, tty->termscript);
+	  if (hyperlink_id)
+	    tty_hyperlink_close (f);
+	  clearerr (tty->output);
+	  unblock_input ();
+	}
+      string += n;
+      len -= n;
     }
 
   /* Turn appearance modes off.  */
@@ -948,11 +1206,17 @@ tty_insert_glyphs (struct frame *f, struct glyph *start, int len)
 
       if (coding->produced > 0)
 	{
+	  unsigned hyperlink_id = glyph ? glyph->hyperlink_id : 0;
+
 	  block_input ();
+	  if (hyperlink_id)
+	    tty_hyperlink_open (f, hyperlink_id);
 	  fwrite (conversion_buffer, 1, coding->produced, tty->output);
-	  clearerr (tty->output);
 	  if (tty->termscript)
 	    fwrite (conversion_buffer, 1, coding->produced, tty->termscript);
+	  if (hyperlink_id)
+	    tty_hyperlink_close (f);
+	  clearerr (tty->output);
 	  unblock_input ();
 	}
 
@@ -1543,6 +1807,7 @@ append_glyph (struct it *it)
       glyph->pixel_width = 1;
       glyph->u.ch = it->char_to_display;
       glyph->face_id = it->face_id;
+      glyph->hyperlink_id = it->hyperlink_id;
       glyph->avoid_cursor_p = it->avoid_cursor_p;
       glyph->multibyte_p = it->multibyte_p;
       glyph->padding_p = i > 0;
@@ -1770,6 +2035,7 @@ append_composite_glyph (struct it *it)
       glyph->avoid_cursor_p = it->avoid_cursor_p;
       glyph->multibyte_p = it->multibyte_p;
       glyph->face_id = it->face_id;
+      glyph->hyperlink_id = it->hyperlink_id;
       glyph->padding_p = false;
       glyph->charpos = CHARPOS (it->position);
       glyph->object = it->object;
@@ -1856,6 +2122,7 @@ append_glyphless_glyph (struct it *it, int face_id, const char *str)
   glyph->avoid_cursor_p = it->avoid_cursor_p;
   glyph->multibyte_p = it->multibyte_p;
   glyph->face_id = face_id;
+  glyph->hyperlink_id = it->hyperlink_id;
   glyph->padding_p = false;
   glyph->charpos = CHARPOS (it->position);
   glyph->object = it->object;

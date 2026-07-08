@@ -554,6 +554,13 @@ struct glyph
      w32_char_font_type.  Otherwise it equals FONT_TYPE_UNKNOWN.  */
   unsigned font_type : 3;
 
+  /* On text terminals, the id of the hyperlink this glyph belongs to,
+     an index into the owning terminal's tty_hyperlink_table; zero
+     means the glyph is not part of a hyperlink.  Always zero on GUI
+     frames.  Like face_id, this interns unbounded nominal data (the
+     URI) outside the glyph so glyphs stay small and comparable.  */
+  unsigned hyperlink_id : 9;
+
   /* A union of sub-structures for different glyph types.  */
   union
   {
@@ -658,14 +665,16 @@ struct glyph
       && (X)->left_box_line_p == (Y)->left_box_line_p		\
       && (X)->right_box_line_p == (Y)->right_box_line_p		\
       && (X)->voffset == (Y)->voffset				\
-      && (X)->pixel_width == (Y)->pixel_width)
+      && (X)->pixel_width == (Y)->pixel_width			\
+      && (X)->hyperlink_id == (Y)->hyperlink_id)
 
 /* Are character codes, faces, padding_ps of glyphs *X and *Y equal?  */
 
 #define GLYPH_CHAR_AND_FACE_EQUAL_P(X, Y)	\
   ((X)->u.ch == (Y)->u.ch			\
    && (X)->face_id == (Y)->face_id		\
-   && (X)->padding_p == (Y)->padding_p)
+   && (X)->padding_p == (Y)->padding_p		\
+   && (X)->hyperlink_id == (Y)->hyperlink_id)
 
 /* Fill a character glyph GLYPH.  CODE, FACE_ID, PADDING_P correspond
    to the bits defined for the typedef `GLYPH' in lisp.h.  */
@@ -2252,6 +2261,7 @@ enum prop_idx
   INVISIBLE_PROP_IDX,
   DISPLAY_PROP_IDX,
   COMPOSITION_PROP_IDX,
+  BROWSE_URL_PROP_IDX,
 
   /* Not a property.  Used to indicate changes in overlays.  */
   OVERLAY_PROP_IDX,
@@ -2559,6 +2569,7 @@ struct it
     bool_bf avoid_cursor_p : 1;
     bool_bf bidi_p : 1;
     bool_bf from_disp_prop_p : 1;
+    unsigned hyperlink_id : 9;
     enum line_wrap_method line_wrap;
 
     /* Properties from display property that are reset by another display
@@ -2633,6 +2644,12 @@ struct it
      beginning of the screen line, not the logical line.  Used by
      'wrap-prefix'.  */
   bool_bf align_visually_p : 1;
+
+  /* On text terminals, id of the hyperlink in effect at the current
+     position (from the `browse-url-data' property), or zero.
+     Interned via tty_intern_hyperlink; copied into glyphs by the tty
+     glyph producers.  */
+  unsigned hyperlink_id : 9;
 
   enum line_wrap_method line_wrap;
 
